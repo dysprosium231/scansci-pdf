@@ -353,7 +353,18 @@ def open_login_browser(
 
         elapsed = 0
         while elapsed < max_wait:
-            time.sleep(2)
+            # Wait via Playwright, not time.sleep: the sync API only processes
+            # browser events (navigations, new tabs) while a Playwright call is
+            # running, so after a bare sleep page.url still shows the login page
+            # the user has long since left.
+            try:
+                live = [p for p in context.pages if not p.is_closed()]
+                if live:
+                    live[-1].wait_for_timeout(2000)
+                else:
+                    time.sleep(2)
+            except Exception:
+                time.sleep(2)
             elapsed += 2
 
             if elapsed % 10 == 0:
@@ -472,79 +483,60 @@ def webvpn_login(config: dict[str, Any]) -> bool:
     cache_dir = Path(config.get("cache_dir", str(DATA_DIR / "cache")))
     cookie_file = cache_dir / "instsci-cookies.json"
 
+    from urllib.parse import urlparse as _urlparse
+    base_root = base.rstrip("/") + "/"
+    base_host = _urlparse(base_root).netloc
+    state = {"last_log": 0.0}
+
+    def _probe(cookies: list[dict[str, Any]]) -> tuple[bool, str]:
+        """Authoritative check: replay the browser's cookies against the gateway root.
+
+        An unauthenticated session is redirected to the gateway's /login (then
+        the school's SSO); an authenticated one stays on the portal. This holds
+        for any WebVPN gateway and needs no cookie-name or page-text guesses.
+        """
+        import requests
+        from .network import USER_AGENT
+        s = requests.Session()
+        s.trust_env = False
+        for c in cookies:
+            s.cookies.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
+        try:
+            resp = s.get(base_root, timeout=15, allow_redirects=True, headers={"User-Agent": USER_AGENT})
+        except Exception as exc:
+            return False, f"probe error: {exc}"
+        final = _urlparse(resp.url)
+        ok = resp.status_code < 400 and final.netloc == base_host and "login" not in final.path.lower()
+        return ok, resp.url
+
     def _detect(context: Any, page: Any) -> bool:
         try:
             cookies = context.cookies()
-            cookie_names = {(c.get("name") or "").lower() for c in cookies}
-
-            # 1. Page DOM and URL checks (when page is available)
+            url, title = "", ""
             if page is not None:
                 try:
-                    # Explicit login form signals -> definitely NOT logged in
-                    has_pwd = page.locator("input[type='password']").count() > 0
-                    has_login_form = (
-                        page.locator("#loginForm").count() > 0 or
-                        page.locator("form[action*='login']").count() > 0 or
-                        page.locator(".btn-login").count() > 0
-                    )
-                    title = ""
-                    try:
-                        title = (page.title() or "").lower()
-                    except Exception:
-                        pass
-                    is_cas = "cas login" in title or "统一身份认证" in title or "用户登录" in title
-
-                    if has_pwd or has_login_form or is_cas:
-                        return False
-
-                    # Portal signals -> authenticated!
-                    has_portal = (
-                        page.locator("text=外文数据库").count() > 0 or
-                        page.locator("text=中文数据库").count() > 0 or
-                        page.locator("text=WEB资源").count() > 0 or
-                        page.locator("text=常用业务系统").count() > 0 or
-                        page.locator("text=退出").count() > 0 or
-                        page.locator("text=注销").count() > 0 or
-                        page.locator("a[href*='logout']").count() > 0
-                    )
-                    if has_portal:
-                        log.info("   [WebVPN] Detected portal marker in DOM")
-                        return True
+                    url = page.evaluate("location.href") or ""  # live, never the cached page.url
+                    title = page.title() or ""
                 except Exception:
                     pass
-
-            # 2. Authoritative cookie checks (gateway sets wrdvpn_upstream_ip after auth)
-            if "wrdvpn_upstream_ip" in cookie_names:
-                log.info("   [WebVPN] Detected wrdvpn_upstream_ip cookie")
-                return True
-
-            # 3. For other WebVPN flavors (ZTE, etc.)
-            if "_zte_sid_" in cookie_names:
-                return True
-
-            # 4. If window was closed or page navigating, check if cookies pass live session probe
-            if any("wengine_vpn_ticket" in n for n in cookie_names) and len(cookies) >= 5:
-                try:
-                    import requests
-                    from .sources.instsci import convert_url
-                    from .network import USER_AGENT
-                    test_url = convert_url("https://www.nature.com", base, config)
-                    jar = requests.cookies.RequestsCookieJar()
-                    for c in cookies:
-                        jar.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
-                    s = requests.Session()
-                    s.trust_env = False
-                    s.cookies.update(jar)
-                    resp = s.get(test_url, timeout=5, allow_redirects=True, headers={"User-Agent": USER_AGENT})
-                    if resp.status_code == 200 and "login" not in resp.url.lower() and "cas" not in resp.url.lower():
-                        log.info("   [WebVPN] Cookie probe verified working session")
-                        return True
-                except Exception:
-                    pass
-
+                # Still on a login form: definitely not logged in yet (skip the probe).
+                low = (url + " " + title).lower()
+                if "统一身份认证" in title or "用户登录" in title or "cas login" in low or "/login" in url.lower():
+                    _log_state(url, title, cookies, "on login page")
+                    return False
+            ok, landed = _probe(cookies)
+            _log_state(url, title, cookies, landed, force=ok)
+            return ok
+        except Exception as exc:
+            log.info(f"   [WebVPN] detect error: {exc}")
             return False
-        except Exception:
-            return False
+
+    def _log_state(url: str, title: str, cookies: list[dict[str, Any]], probe: str, force: bool = False) -> None:
+        now = time.monotonic()
+        if force or now - state["last_log"] >= 10:
+            state["last_log"] = now
+            names = sorted({c.get("name", "") for c in cookies if base_host in (c.get("domain") or "")})
+            log.info(f"   [WebVPN] url={url[:70]} title={title[:30]!r} vpn_cookies={names} probe={probe[:70]}")
 
     return open_login_browser(base, config, cookie_file=cookie_file, detect_login=_detect, max_wait=600)
 
