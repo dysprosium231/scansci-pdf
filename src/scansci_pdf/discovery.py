@@ -53,8 +53,19 @@ class DiscoveryTimeoutError(RuntimeError):
         self.retryable = retryable
 
 
+def _which_cli() -> str | None:
+    """Locate the scansci-find CLI on PATH, else next to this interpreter.
+
+    MCP clients often launch the server by absolute path without the virtual
+    environment's Scripts/bin directory on PATH, so a CLI installed into the
+    same venv would otherwise be reported missing.
+    """
+    import sys
+    return shutil.which(CLI_NAME) or shutil.which(CLI_NAME, path=str(Path(sys.executable).parent))
+
+
 def _cli_path() -> str:
-    path = shutil.which(CLI_NAME)
+    path = _which_cli()
     if not path:
         raise DiscoveryUnavailableError(
             f"'{CLI_NAME}' not found on PATH. Install ScanSci Find: "
@@ -66,7 +77,7 @@ def _cli_path() -> str:
 
 def find_cli_available() -> bool:
     """Check whether the scansci-find CLI is installed and responds."""
-    path = shutil.which(CLI_NAME)
+    path = _which_cli()
     if not path:
         return False
     try:

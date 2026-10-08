@@ -271,6 +271,7 @@ def _run_tier(
 ) -> dict[str, Any] | None:
     if not tier_sources:
         return None
+    _SETTLED.discard(normalize_doi(doi) if not is_arxiv_identifier(doi) else doi)  # see _run_tiers_parallel
 
     if len(tier_sources) == 1:
         fn, label = tier_sources[0]
@@ -457,6 +458,10 @@ def _run_tiers_parallel(
     """
     if failures is None:
         failures = []
+    # A new race for this DOI is live again: callers such as batch_download race
+    # without going through download(), so clear any earlier "settled" mark here
+    # or every result of this race would be discarded as a late finisher.
+    _SETTLED.discard(normalize_doi(doi) if not is_arxiv_identifier(doi) else doi)
     # Delegate to the compiled racing engine only for the flat race: the
     # hedged cascade needs staggered submission, which the compiled engine
     # does not model.
