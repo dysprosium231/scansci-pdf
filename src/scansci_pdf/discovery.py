@@ -69,7 +69,8 @@ def _cli_path() -> str:
     if not path:
         raise DiscoveryUnavailableError(
             f"'{CLI_NAME}' not found on PATH. Install ScanSci Find: "
-            "pip install scansci-find (https://github.com/Rimagination/scansci-find). "
+            "pip install git+https://github.com/Rimagination/easyseek.git "
+            "(not on PyPI; the scansci-find package lives in Rimagination/easyseek). "
             "Alternatively use the local fallbacks: search / verify / resolve-oa / build-queue."
         )
     return path

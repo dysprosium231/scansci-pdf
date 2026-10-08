@@ -19,6 +19,8 @@ from .log import get_logger
 log = get_logger()
 
 _LOADING_TITLES = ("loading", "请稍候", "please wait", "just a moment", "redirecting")
+_FINAL_BLOCK_MARKERS = ("浏览器不支持", "browser is not supported", "unsupported browser",
+                        "your browser is not supported")
 
 PAGE_PDF_LINK_JS = """
 () => {
@@ -56,6 +58,14 @@ def wait_page_settled(page: Any, max_wait_s: float = 30.0) -> tuple[str, str]:
         low = title.strip().lower()
         if low and not any(low.startswith(t) or t in low for t in _LOADING_TITLES):
             return title, url
+        # Cloudflare's "unsupported browser" verdict keeps the "请稍候" title
+        # forever (e.g. a challenge rewritten by a WebVPN); waiting is futile.
+        try:
+            body = (page.evaluate("document.body ? document.body.innerText.slice(0, 2000) : ''") or "").lower()
+            if any(m in body for m in _FINAL_BLOCK_MARKERS):
+                return title, url
+        except Exception:
+            pass
         page.wait_for_timeout(1000)
         waited += 1.0
     return title, url

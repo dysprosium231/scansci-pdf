@@ -1433,6 +1433,9 @@ def _batch_institutional_phase(
                                 type("R", (), {"ok": True, "pdf_path": pdf_path, "text_length": 0})(),
                                 doi, output_dir, profile_name,
                             )
+                            # Phase 1 renames inside download(); phase-2 files
+                            # were left as <doi>.pdf.
+                            _auto_rename(result, doi, config, doi=doi, target_dir=output_dir)
                         else:
                             result = fail(doi, "PDF not found after batch download")
                     else:
@@ -1551,6 +1554,7 @@ def batch_download(
 ) -> dict[str, Any]:
     config = load_config()
     workers = config.get("batch_workers", 5)
+    batch_t0 = time.monotonic()
 
     # Duplicate detection via DOI normalization
     seen_dois: set[str] = set()
@@ -1763,8 +1767,33 @@ def batch_download(
         "failed_dois": failed_dois,
         "batch_id": batch_id,
     }
+    _close_batch_browsers(batch_t0, unique_identifiers)
     _write_download_results(all_results, output_dir)
     return summary
+
+
+def _close_batch_browsers(t0: float, identifiers: list[str]) -> None:
+    """End-of-batch cleanup: waived downloads stop launching, their windows close.
+
+    Per-paper cleanup in download() is skipped while other papers of the batch
+    are still in flight, so windows of waived stragglers would otherwise stay
+    open after the batch reports. Only closes when every download still in
+    flight belongs to this batch, never a concurrent unrelated download.
+    """
+    keys = {normalize_doi(i) if not is_arxiv_identifier(i) else i for i in identifiers}
+    with _INFLIGHT_LOCK:
+        _SETTLED.update(keys)
+        foreign = _INFLIGHT - keys
+    if foreign:
+        log.info(f"Batch cleanup skipped: {len(foreign)} unrelated download(s) in flight")
+        return
+    try:
+        from ..browser_backend import close_browsers_since
+        n = close_browsers_since(t0)
+        if n:
+            log.info(f"Batch cleanup: closed {n} browser(s) left open by this batch")
+    except Exception as exc:
+        log.info(f"Batch browser cleanup skipped: {exc}")
 
 try:
     from .. import browser_backend as _bb

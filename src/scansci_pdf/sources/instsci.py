@@ -214,7 +214,11 @@ def session_status(config: dict[str, Any]) -> str:
     if not base:
         return "none"
     from ..network import USER_AGENT
-    test_url = convert_url("https://www.nature.com", base, config)
+    # Probe the gateway root, not a proxied publisher: an expired session is
+    # redirected to the gateway's /login (then the school SSO) either way, but a
+    # proxied site adds its own latency/failures and WebVPN remembers it as the
+    # post-login target (users landed on nature.com after logging in).
+    test_url = base.rstrip("/") + "/"
     try:
         s = requests.Session()
         s.trust_env = False
@@ -928,6 +932,18 @@ def _try_instsci_browser(doi: str, output_path: Path, config: dict[str, Any]) ->
                 page_title, page_url = wait_page_settled(page)
 
         log.info(f"   [WebVPN-Browser] On page: title='{page_title[:40]}' url={page_url[:60]}")
+
+        # A Cloudflare challenge served *through* the WebVPN cannot pass: the
+        # gateway rewrites the challenge's scripts ("browser not supported").
+        # Report it as a block so the (WebVPN, publisher) negative cache skips
+        # this lane for the publisher's next papers instead of opening another
+        # doomed window each time.
+        from ..network import is_cloudflare_challenge
+        from ..pdf_utils import fail
+        if is_cloudflare_challenge(page_title) and urllib.parse.urlparse(page_url).netloc == base_host:
+            log.info("   [WebVPN-Browser] Cloudflare challenge inside the WebVPN — publisher unusable via VPN")
+            return fail(doi, "Cloudflare challenge inside WebVPN",
+                        error_type="cloudflare_blocked", action="use_direct_or_carsi")
 
         # Check network-captured PDF
         result = _save_captured()

@@ -17,4 +17,7 @@ def get_logger() -> logging.Logger:
             handler.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
             _logger.addHandler(handler)
             _logger.setLevel(logging.INFO)
+        # The entry points also basicConfig() a stderr handler on the root
+        # logger; propagating there printed every message twice.
+        _logger.propagate = False
     return _logger

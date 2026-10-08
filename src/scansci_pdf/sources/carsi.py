@@ -528,6 +528,15 @@ class CARSIClient:
             sso_keywords = ("wayf", "shibboleth", "saml", "idp.bayern", "passport")
             if any(k in url_lower for k in sso_keywords):
                 return False
+            # Cloudflare-fronted publishers (ScienceDirect, Wiley, ...) challenge
+            # every non-browser request, so this probe cannot tell a live session
+            # from a dead one. Trust the freshness check above; the browser flow
+            # verifies access on the article page itself.
+            server = resp.headers.get("server", "").lower()
+            if resp.headers.get("cf-mitigated") == "challenge" or (
+                    resp.status_code in (403, 503) and "cloudflare" in server):
+                log.info(f"   [CARSI] {publisher}: Cloudflare blocks the HTTP probe; using fresh cookies")
+                return True
             return resp.status_code == 200
         except requests.RequestException:
             return False

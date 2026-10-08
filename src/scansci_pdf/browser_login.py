@@ -229,6 +229,17 @@ def _save_cookies_netscape(cookies: list[dict[str, Any]], cookie_file: Path) -> 
 
 def _import_to_browser(cookie_file: Path, config: dict[str, Any]) -> int:
     """Import cookies into CloakBrowser. Returns count imported."""
+    # The login window's sync Playwright still owns this thread's event loop,
+    # and the shared browser cannot start under it ("Sync API inside an asyncio
+    # loop"). Nothing is lost by skipping: download tabs re-import the saved
+    # cookie files when they open (_inject_cookies_to_tab).
+    try:
+        import asyncio
+        asyncio.get_running_loop()
+        log.info("   [browser] Cookies saved; the shared browser loads them on the next download")
+        return 0
+    except RuntimeError:
+        pass
     try:
         from .browser_engine import import_cookies, is_available
         if not is_available(config):
