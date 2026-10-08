@@ -54,7 +54,7 @@ def try_openalex_content_api(doi: str, output_path: Path, config: dict[str, Any]
         return None
 
     q = urllib.parse.quote(doi, safe="")
-    meta_url = f"https://api.openalex.org/works/doi:{q}?mailto={api_key}"
+    meta_url = f"https://api.openalex.org/works/doi:{q}?api_key={api_key}"  # was sent as mailto
     try:
         payload = fetch_json(meta_url, config)
         if not payload:
@@ -70,7 +70,7 @@ def try_openalex_content_api(doi: str, output_path: Path, config: dict[str, Any]
         if not oa.get("is_oa"):
             return None
 
-        content_url = f"https://content.openalex.org/works/{work_id}.pdf?mailto={api_key}"
+        content_url = f"https://content.openalex.org/works/{work_id}.pdf?api_key={api_key}"
         polite_delay(config)
 
         s = requests.Session()

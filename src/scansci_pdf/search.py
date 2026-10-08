@@ -17,9 +17,29 @@ _SEARCH_TIMEOUT = 30  # seconds, longer than default because these are public AP
 _USER_AGENT = "scansci-pdf/1.5 (https://github.com/Rimagination/scansci-pdf)"
 
 
+class _AcademicSession(requests.Session):
+    """Adds the OpenAlex API key to api.openalex.org requests only.
+
+    OpenAlex requires an API key on every call (since 2026-02); the same
+    session also talks to other APIs, which must never receive the key.
+    """
+
+    def request(self, method, url, *args, **kwargs):  # type: ignore[override]
+        if str(url).startswith("https://api.openalex.org/"):
+            try:
+                key = str(load_config().get("openalex_api_key") or "").strip()
+            except Exception:
+                key = ""
+            if key:
+                params = dict(kwargs.get("params") or {})
+                params.setdefault("api_key", key)
+                kwargs["params"] = params
+        return super().request(method, url, *args, **kwargs)
+
+
 def _plain_session() -> requests.Session:
     """A requests session without proxy, for public academic APIs."""
-    s = requests.Session()
+    s = _AcademicSession()
     s.headers.update({"User-Agent": _USER_AGENT, "mailto": "scansci-pdf@example.invalid"})
     return s
 

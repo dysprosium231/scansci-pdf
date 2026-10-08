@@ -297,3 +297,27 @@ def test_wait_any_returns_early_once_cancelled(no_browser_kill):
             "10.1/x", Path("."), Path("o.pdf"), {}, False, 3) is None
     finally:
         sources._DL_TLS.gen = None
+
+
+# ---------------------------------------------------------------- OpenAlex key
+
+def test_openalex_key_only_sent_to_openalex(monkeypatch):
+    import requests
+    import scansci_pdf.search as search_mod
+    monkeypatch.setattr(search_mod, "load_config", lambda: {"openalex_api_key": "K123"})
+    sent = {}
+    monkeypatch.setattr(requests.Session, "request",
+                        lambda self, m, url, *a, **kw: sent.setdefault(url, kw.get("params")))
+    s = search_mod._plain_session()
+    s.get("https://api.openalex.org/works", params={"search": "x"})
+    s.get("https://api.semanticscholar.org/graph/v1/paper/search", params={"query": "x"})
+    assert sent["https://api.openalex.org/works"] == {"search": "x", "api_key": "K123"}
+    assert "api_key" not in (sent["https://api.semanticscholar.org/graph/v1/paper/search"] or {})
+
+
+def test_openalex_source_sends_key_as_api_key(monkeypatch, tmp_path):
+    from scansci_pdf.sources import openalex
+    urls = []
+    monkeypatch.setattr(openalex, "fetch_json", lambda url, cfg: urls.append(url) or None)
+    openalex.try_openalex_content_api("10.1/x", tmp_path / "o.pdf", {"openalex_api_key": "K123"})
+    assert urls and "api_key=K123" in urls[0] and "mailto=K123" not in urls[0]
