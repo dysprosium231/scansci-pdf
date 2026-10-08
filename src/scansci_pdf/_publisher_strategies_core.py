@@ -2954,7 +2954,7 @@ def _resolve_elsevier_pii(doi: str, config: dict[str, Any]) -> str | None:
         html = resp.text
 
         # Extract PII from URL
-        pii_match = re.search(r'pii/(S\d+)', final_url)
+        pii_match = re.search(r'pii/(S[0-9A-Za-z]+)', final_url)  # PII may end in check char 'X'
         if not pii_match:
             return None
         pii = pii_match.group(1)

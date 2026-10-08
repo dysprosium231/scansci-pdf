@@ -237,7 +237,11 @@ def _patchright_browser_kwargs(config: dict[str, Any] | None) -> dict[str, Any]:
     explicit = str(cfg.get("browser_executable", "") or "").strip()
     if explicit:
         if Path(explicit).exists():
-            return {"executable_path": explicit}
+            # A dedicated browser (e.g. Chrome for Testing) runs under the stable
+            # scansci-chrome.exe name; the system Chrome shares its name with the
+            # user's own browser and cannot be singled out anyway.
+            dedicated = "program files" not in explicit.lower()
+            return {"executable_path": stable_browser_alias(explicit) if dedicated else explicit}
         logger.warning("browser_backend: browser_executable '%s' not found, using channel=chrome", explicit)
     return {"channel": "chrome"}
 
@@ -427,6 +431,47 @@ def _enforce_cloakbrowser_floor() -> None:
     )
 
 
+STABLE_BROWSER_NAME = "scansci-chrome.exe"
+
+
+def stable_browser_alias(binary: str | Path) -> str:
+    """Return a hard link named scansci-chrome.exe next to a dedicated Chromium binary.
+
+    Gives every Chromium process the plugin launches a stable, unique process
+    name, so proxy/TUN bypass rules can target it by name: versioned install
+    directories break per-path rules on upgrade, and a bare "chrome.exe" rule
+    would also catch the user's own Chrome. Recreated automatically when the
+    binary is replaced. Windows only; returns the original path on failure.
+    """
+    original = Path(binary)
+    if os.name != "nt" or original.name.lower() == STABLE_BROWSER_NAME:
+        return str(original)
+    try:
+        alias = original.with_name(STABLE_BROWSER_NAME)
+        if not alias.exists() or alias.stat().st_size != original.stat().st_size                 or alias.stat().st_mtime < original.stat().st_mtime:
+            if alias.exists():
+                alias.unlink()
+            try:
+                os.link(original, alias)
+            except OSError:
+                shutil.copy2(original, alias)
+            logger.info("browser_backend: created %s -> %s", alias, original.name)
+        return str(alias)
+    except Exception as exc:  # never block a launch over the alias
+        logger.info("browser_backend: stable browser name unavailable (%s)", exc)
+        return str(original)
+
+
+def _use_stable_cloak_binary() -> None:
+    """Point CloakBrowser at a scansci-chrome.exe alias of its bundled Chromium."""
+    if os.name != "nt" or os.environ.get("CLOAKBROWSER_BINARY_PATH"):
+        return  # non-Windows, or a binary was pinned explicitly (local Chrome, user build)
+    try:
+        from cloakbrowser.download import ensure_binary
+        os.environ["CLOAKBROWSER_BINARY_PATH"] = stable_browser_alias(ensure_binary())
+    except Exception as exc:
+        logger.info("browser_backend: stable browser name unavailable (%s)", exc)
+
 def _launch_cloakbrowser(
     headless: bool,
     proxy: Any,
@@ -435,6 +480,7 @@ def _launch_cloakbrowser(
     **kwargs: Any,
 ) -> Any:
     _enforce_cloakbrowser_floor()
+    _use_stable_cloak_binary()
     from cloakbrowser import launch
 
     return launch(headless=headless, humanize=humanize, args=args, proxy=proxy, **kwargs)
@@ -449,6 +495,7 @@ def _launch_cloakbrowser_persistent(
     **kwargs: Any,
 ) -> Any:
     _enforce_cloakbrowser_floor()
+    _use_stable_cloak_binary()
     from cloakbrowser import launch_persistent_context
 
     return launch_persistent_context(
