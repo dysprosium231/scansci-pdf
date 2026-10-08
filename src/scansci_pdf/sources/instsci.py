@@ -21,6 +21,7 @@ from typing import Any
 import requests
 from bs4 import BeautifulSoup
 
+from ..browser_pdf import capture_pdf_via_cdp, find_page_pdf_link, wait_page_settled
 from ..log import get_logger
 from ..pdf_utils import (
     _response_looks_pdf,
@@ -798,11 +799,11 @@ def _try_instsci_browser(doi: str, output_path: Path, config: dict[str, Any]) ->
             page.goto(webvpn_url, wait_until="domcontentloaded", timeout=60000)
         except Exception:
             pass
-        time.sleep(3)
+        # WebVPN first shows a "Loading https://..." interstitial, then redirects
+        # (possibly to the school's SSO); judge login state only once it settles.
+        title, url_now = wait_page_settled(page)
 
         # If on login page, wait for user to login then retry
-        title = page.title()
-        url_now = page.url
         from ..publisher_strategies import _school_auth_patterns
         _stoks = _school_auth_patterns(config)
         _auth_url_signals = list(_stoks) + ["/do/off/ui/auth"]
@@ -812,10 +813,11 @@ def _try_instsci_browser(doi: str, output_path: Path, config: dict[str, Any]) ->
             print(f"  检测到登录页面，请完成登录...")
             # Wait up to 5 minutes, checking title every 3 seconds
             for i in range(100):
-                time.sleep(3)
                 try:
-                    title = page.title()
-                    url_now = page.url
+                    page.wait_for_timeout(3000)
+                    # Post-login SAML/redirect hops also pass through interstitials
+                    # without auth keywords; wait for them before declaring success.
+                    title, url_now = wait_page_settled(page, max_wait_s=15)
                 except Exception:
                     return None
                 if i % 10 == 0:
@@ -896,15 +898,50 @@ def _try_instsci_browser(doi: str, output_path: Path, config: dict[str, Any]) ->
                     return success(doi, output_path, "WebVPN(Browser)")
             return None
 
+        def _save_bytes(pdf_bytes: bytes | None) -> dict[str, Any] | None:
+            if pdf_bytes:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(pdf_bytes)
+                if is_pdf_file(output_path):
+                    return success(doi, output_path, "WebVPN(Browser)")
+            return None
+
         # Check if page itself is a PDF (inline viewer)
-        page_url = page.url
-        page_title = page.title()
+        page_title, page_url = wait_page_settled(page)
+
+        # Some publishers are not proxied by the WebVPN: the school routes them to
+        # federated SSO (e.g. Elsevier via Shibboleth), and after login the IdP
+        # returns to the publisher's *homepage* outside the VPN. The session is then
+        # valid on the publisher itself, so open the article there directly.
+        base_host = urllib.parse.urlparse(base).netloc
+        if urllib.parse.urlparse(page_url).netloc not in ("", base_host):
+            direct_url = resolved_url
+            _lh = re.search(r"linkinghub\.elsevier\.com/retrieve/pii/([A-Za-z0-9]+)", direct_url)
+            if _lh:
+                direct_url = f"https://www.sciencedirect.com/science/article/pii/{_lh.group(1)}"
+            if urllib.parse.urlparse(direct_url).path.rstrip("/") != urllib.parse.urlparse(page_url).path.rstrip("/"):
+                log.info(f"   [WebVPN-Browser] Left the VPN for {urllib.parse.urlparse(page_url).netloc}; opening article directly: {direct_url[:80]}")
+                try:
+                    page.goto(direct_url, wait_until="domcontentloaded", timeout=60000)
+                except Exception:
+                    pass
+                page_title, page_url = wait_page_settled(page)
+
         log.info(f"   [WebVPN-Browser] On page: title='{page_title[:40]}' url={page_url[:60]}")
 
         # Check network-captured PDF
         result = _save_captured()
         if result:
             return result
+
+        # Strategy 0: the article page's own PDF link (carries page-issued tokens),
+        # opened by the browser itself and read via CDP
+        page_pdf_href = find_page_pdf_link(page)
+        if page_pdf_href:
+            log.info(f"   [WebVPN-Browser] Page PDF link: {page_pdf_href[:80]}")
+            result = _save_bytes(capture_pdf_via_cdp(context, page, page_pdf_href))
+            if result:
+                return result
 
         # If page looks like inline PDF viewer, try to get the PDF bytes
         if _is_inline_pdf_page(page):
@@ -923,9 +960,12 @@ def _try_instsci_browser(doi: str, output_path: Path, config: dict[str, Any]) ->
             if result:
                 return result
 
-            # Fallback: expect_download in browser
+            # Fallback: open in browser, read the body via CDP, then expect_download
             pdf_webvpn = convert_url(pdf_url, base, config)
             log.info(f"   [WebVPN-Browser] Trying direct PDF via browser: {pdf_webvpn[:80]}")
+            result = _save_bytes(capture_pdf_via_cdp(context, page, pdf_webvpn))
+            if result:
+                return result
             captured_pdf.clear()
             try:
                 with page.expect_download(timeout=30000) as download_info:
@@ -953,8 +993,13 @@ def _try_instsci_browser(doi: str, output_path: Path, config: dict[str, Any]) ->
                             return success(doi, output_path, "WebVPN(Browser)")
 
         # Strategy 2: Find PDF link in HTML, try browser-cookie HTTP first
-        html = page.content()
-        found_pdf_url = extract_pdf_url_from_html(html, page.url)
+        wait_page_settled(page, max_wait_s=15)
+        try:
+            html = page.content()
+        except Exception as exc:
+            log.info(f"   [WebVPN-Browser] page content unavailable: {exc}")
+            html = ""
+        found_pdf_url = extract_pdf_url_from_html(html, page.url) if html else None
         if found_pdf_url:
             log.info(f"   [WebVPN-Browser] Found PDF link: {found_pdf_url[:80]}")
             result = _download_pdf_with_browser_cookies(found_pdf_url, output_path, config, doi, context)

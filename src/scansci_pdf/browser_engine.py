@@ -551,6 +551,11 @@ def import_cookies(cookie_file: str | Path, config: dict[str, Any], *, domain_su
         logger.info(f"browser_engine: failed to read cookie file: {e}")
         return 0
     cookies = _parse_netscape_cookies(text)
+    # Cloudflare clearance/bot cookies are bound to the browser fingerprint and IP
+    # they were issued to; replaying stale ones into another session triggers
+    # fresh challenges instead of skipping them.
+    cookies = [c for c in cookies if not (c.get("name", "") in ("cf_clearance", "__cf_bm", "_cfuvid")
+                                           or c.get("name", "").startswith("cf_chl"))]
     if not cookies:
         return 0
     if domain_suffix:
@@ -906,6 +911,13 @@ def fetch_url(
     if not page:
         logger.info(f"browser_engine: fetch_url - tab {tab_id} not found")
         return None
+
+    # The inline PDF viewer hides the body from the response listener; read it
+    # from the paused response via CDP while the browser itself makes the request.
+    from .browser_pdf import capture_pdf_via_cdp
+    pdf_bytes = capture_pdf_via_cdp(page.context, page, url, timeout_s=max(timeout, 90.0))
+    if pdf_bytes:
+        return {"status": "ok", "bytes": len(pdf_bytes), "data": pdf_bytes}
 
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=int(timeout * 1000))

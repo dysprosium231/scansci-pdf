@@ -5,6 +5,7 @@ and it will be tried in the download tier system without requiring instsci_enabl
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +44,11 @@ def try_carsi(doi: str, output_path: Path, config: dict[str, Any]) -> dict[str, 
         # If resolved URL is on a mirror/proxy domain, rebuild using primary domain
         from urllib.parse import urlparse
         cfg = client._publisher_configs.get(publisher)
+        # Elsevier DOIs resolve to linkinghub.elsevier.com/retrieve/pii/<PII>; that path does
+        # not exist on sciencedirect.com, so map it to the real article page.
+        _lh = re.search(r"linkinghub\.elsevier\.com/retrieve/pii/([A-Za-z0-9]+)", resolved_url)
+        if _lh:
+            resolved_url = f"https://www.sciencedirect.com/science/article/pii/{_lh.group(1)}"
         if cfg:
             resolved_host = urlparse(resolved_url).hostname or ""
             primary_domain = cfg.domains[0]

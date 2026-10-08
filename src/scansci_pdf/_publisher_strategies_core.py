@@ -368,6 +368,13 @@ def _try_institutional_login(tab_id: str, config: dict[str, Any], publisher: str
     needs_login = any(x in current_url.lower() for x in _ak) or any(x in current_title for x in _at)
 
     if needs_login:
+        shared_headless = bool(config.get("scihub_browser_headless", config.get("browser_headless", False)))
+        if not shared_headless:
+            # The shared browser window is visible: the user logs in right here.
+            # Opening a second window would (a) restart the login the user is
+            # already doing and (b) start a second sync Playwright in this
+            # thread, which breaks the shared browser ("Event loop is closed").
+            return _wait_login_in_tab(tab_id, config, publisher, idp_name)
         # browser-engine is headless — user can't see the tab
         # Open a visible browser window for the CAS login
         log.info(f"   [{publisher}] CAS login required — opening visible browser...")
@@ -376,6 +383,40 @@ def _try_institutional_login(tab_id: str, config: dict[str, Any], publisher: str
     # If we ended up back on the article page, login might have succeeded via cookies
     log.info(f"   [{publisher}] institutional login flow completed")
     return True
+
+
+def _wait_login_in_tab(tab_id: str, config: dict[str, Any], publisher: str, idp_name: str) -> bool:
+    """Wait for the user to finish institutional login in the (visible) shared-browser tab."""
+    from .browser_engine import _resolve_tab
+    from .browser_pdf import wait_url_stable
+
+    page = _resolve_tab(tab_id)
+    if page is None:
+        return False
+    log.info(f"   [{publisher}] CAS login required — please log in in the open browser window")
+    print(f"\n  请在已打开的浏览器窗口中完成机构登录 ({idp_name})")
+    print("  登录成功后会自动继续下载\n")
+
+    for _ in range(100):  # ~5 min
+        try:
+            page.wait_for_timeout(3000)
+            title = page.title() or ""
+            url = page.url or ""
+        except Exception:
+            log.info(f"   [{publisher}] browser closed during login")
+            return False
+        is_auth = any(x in title for x in _AUTH_TITLES) or any(x in url.lower() for x in _AUTH_KEYWORDS)
+        if not is_auth:
+            wait_url_stable(page)
+            log.info(f"   [{publisher}] login finished, back at {page.url[:70]}")
+            try:
+                _save_all_cookie_formats(page.context.cookies(), publisher, config)
+            except Exception as e:
+                log.info(f"   [{publisher}] cookie save note: {e}")
+            return True
+
+    log.info(f"   [{publisher}] login timed out")
+    return False
 
 
 def _visible_institutional_login(
@@ -555,9 +596,26 @@ def _visible_browser_download(
         else:
             log.info(f"   [{publisher}] Cloudflare challenge did not resolve")
 
-        title = page.title()
-        url = page.url
+        # Let interstitials ("Loading https://...") and auth hops finish before
+        # reading the page; evaluating mid-navigation raises.
+        from .browser_pdf import capture_pdf_via_cdp, find_page_pdf_link, wait_page_settled, wait_url_stable
+        wait_url_stable(page)
+        title, url = wait_page_settled(page)
         log.info(f"   [{publisher}] page: '{title[:40]}' {url[:60]}")
+
+        def _page_pdf_via_cdp() -> dict[str, Any] | None:
+            """Open the page's own PDF link in the browser and read the body via CDP."""
+            href = find_page_pdf_link(page)
+            if not href:
+                return None
+            log.info(f"   [{publisher}] page PDF link: {href[:80]}")
+            body = capture_pdf_via_cdp(context, page, href)
+            if body:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_bytes(body)
+                if is_pdf_file(output_path):
+                    return success(doi, output_path, f"{publisher}(Visible)")
+            return None
 
         # Check if already on auth page (previous cookies caused redirect)
         already_on_auth = any(x in (title or "") for x in _AUTH_TITLES) or \
@@ -566,6 +624,9 @@ def _visible_browser_download(
         # Try fetching PDF first — if it works, no login needed
         pdf_fetched = False
         if not already_on_auth:
+            result = _page_pdf_via_cdp()
+            if result:
+                return result
             log.info(f"   [{publisher}] trying direct PDF fetch...")
             fetch_result = _try_browser_fetch_pdf(page, pdf_paths)
             if fetch_result:
@@ -670,6 +731,11 @@ def _visible_browser_download(
             time.sleep(5)
         except Exception:
             pass
+        wait_url_stable(page)
+        wait_page_settled(page)
+        result = _page_pdf_via_cdp()
+        if result:
+            return result
 
         # Try downloading PDF via in-browser fetch (post-login)
         fetch_result = _try_browser_fetch_pdf(page, pdf_paths)
@@ -1697,8 +1763,32 @@ def _browser_download(
         if wait_for_loading > 0:
             time.sleep(wait_for_loading)
 
-        # Wait for page to settle
+        # Wait for page to settle: publisher pages keep redirecting after
+        # DOMContentLoaded (e.g. ScienceDirect -> id.elsevier.com OAuth -> back),
+        # and reading the DOM mid-hop fails. Then give JS-rendered PDF links
+        # (ScienceDirect's "View PDF") time to appear.
         time.sleep(3)
+        from .browser_engine import _resolve_tab
+        from .browser_pdf import find_page_pdf_link, wait_url_stable
+        _page = _resolve_tab(tab_id)
+        if _page is not None:
+            settled_url = wait_url_stable(_page)
+            log.info(f"   [{publisher}] page settled at {settled_url[:80]}")
+            # If the page already offers its own PDF link, the session is entitled:
+            # take it directly (text-based paywall detection misfires on pages that
+            # show "access through your institution" even when access is granted).
+            _href = find_page_pdf_link(_page, max_wait_s=10)
+            if _href:
+                from .browser_pdf import capture_pdf_via_cdp
+                log.info(f"   [{publisher}] page PDF link: {_href[:80]}")
+                _body = capture_pdf_via_cdp(_page.context, _page, _href)
+                if _body:
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    output_path.write_bytes(_body)
+                    from .pdf_utils import success
+                    if is_pdf_file(output_path):
+                        close_tab(tab_id, config)
+                        return success(doi, output_path, f"{publisher}(Browser)")
 
         # Detect meta-refresh redirects (e.g., linkinghub.elsevier.com)
         # Wait longer if we're on a redirect page
@@ -1754,13 +1844,32 @@ def _browser_download(
         if _detect_paywall(html):
             log.info(f"   [{publisher}] paywall detected — trying institutional login...")
             if _try_institutional_login(tab_id, config, publisher):
-                # Login succeeded, re-fetch page content
-                time.sleep(3)
+                # Login succeeded. The IdP may return to the site's homepage, so
+                # reopen the article, then take its own PDF link if it now has one.
+                navigate_tab(tab_id, article_url, config, timeout=60.0)
+                _page = _resolve_tab(tab_id)
+                if _page is not None:
+                    wait_url_stable(_page)
+                    _href = find_page_pdf_link(_page, max_wait_s=10)
+                    if _href:
+                        from .browser_pdf import capture_pdf_via_cdp
+                        log.info(f"   [{publisher}] page PDF link after login: {_href[:80]}")
+                        _body = capture_pdf_via_cdp(_page.context, _page, _href)
+                        if _body:
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+                            output_path.write_bytes(_body)
+                            from .pdf_utils import success
+                            if is_pdf_file(output_path):
+                                close_tab(tab_id, config)
+                                return success(doi, output_path, f"{publisher}(Browser)")
                 html = evaluate_js(tab_id, "document.documentElement.outerHTML", config) or html
                 current_url = evaluate_js(tab_id, "window.location.href", config) or article_url
                 if _detect_paywall(html):
-                    log.info(f"   [{publisher}] still behind paywall after login")
-                    _set_error("paywall", "login_required")
+                    # Logged in, yet no full text: the institution does not
+                    # subscribe to this content. Asking to log in again (the
+                    # visible-browser fallback) would only loop.
+                    log.info(f"   [{publisher}] still behind paywall after login — institution not entitled")
+                    _set_error("not_entitled", "no_subscription")
                     return False
             else:
                 _set_error("paywall", "login_required")
@@ -2032,9 +2141,12 @@ def _browser_download_with_fallback(
     output_path: Path,
     config: dict[str, Any],
     publisher: str,
+    *,
+    wait_for_loading: float = 0,
 ) -> bool:
     """Try headless browser download, fallback to visible browser if paywall detected."""
-    result = _browser_download(doi, article_url, output_path, config, publisher)
+    result = _browser_download(doi, article_url, output_path, config, publisher,
+                               wait_for_loading=wait_for_loading)
     if result:
         return True
 

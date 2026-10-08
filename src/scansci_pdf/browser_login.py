@@ -63,6 +63,7 @@ class PersistentBrowser:
         self._browser = launch(
             headless=False, humanize=True,
             args=["--disable-features=CrossOriginOpenerPolicy"],
+            config=config,
         )
         self._context = self._browser.new_context()
         self._page = self._context.new_page()
@@ -273,7 +274,8 @@ def open_login_browser(
 
     try:
         browser = launch(headless=False, humanize=True,
-                         args=["--disable-features=CrossOriginOpenerPolicy"])
+                         args=["--disable-features=CrossOriginOpenerPolicy"],
+                         config=config)
         context = browser.new_context()
         page = context.new_page()
 

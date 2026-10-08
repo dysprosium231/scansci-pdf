@@ -585,7 +585,29 @@ def _proxy_from_config(config: dict[str, Any] | None) -> Any:
     return {"server": proxy} if proxy else None
 
 
-def launch(
+def _resolve_launch_config(config: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Fall back to the saved config when a caller passes none, so ``browser_backend``
+    and ``browser_auto_upgrade`` are honored on every launch path."""
+    if config is not None:
+        return config
+    try:
+        from .config import load_config
+        return load_config()
+    except Exception:
+        return None
+
+
+def _direct_args(backend: str, proxy: Any, args: list[str] | None) -> list[str] | None:
+    """Chromium backends bypass the OS/system proxy unless an explicit proxy is given."""
+    if proxy is not None or backend == BACKEND_CAMOUFOX:
+        return args
+    args = list(args or [])
+    if not any(a.startswith(("--no-proxy-server", "--proxy-server")) for a in args):
+        args.append("--no-proxy-server")
+    return args
+
+
+def _launch_unregistered(
     *,
     headless: bool = True,
     proxy: Any = None,
@@ -600,9 +622,11 @@ def launch(
     the patchright backend. Returns the same object as
     ``playwright.chromium.launch()`` / ``cloakbrowser.launch()``.
     """
+    config = _resolve_launch_config(config)
     backend = resolve_backend(config)
     if backend == BACKEND_CAMOUFOX and proxy is None:
         proxy = _proxy_from_config(config)
+    args = _direct_args(backend, proxy, args)
     if backend == BACKEND_PATCHRIGHT:
         if humanize:
             logger.debug("browser_backend: humanize not supported by patchright, ignored")
@@ -612,7 +636,7 @@ def launch(
     return _launch_cloakbrowser(headless=headless, proxy=proxy, args=args, humanize=humanize, **kwargs)
 
 
-def launch_persistent_context(
+def _launch_persistent_unregistered(
     user_data_dir: str,
     *,
     headless: bool = True,
@@ -626,9 +650,11 @@ def launch_persistent_context(
 
     Same contract as ``playwright.chromium.launch_persistent_context()``.
     """
+    config = _resolve_launch_config(config)
     backend = resolve_backend(config)
     if backend == BACKEND_CAMOUFOX and proxy is None:
         proxy = _proxy_from_config(config)
+    args = _direct_args(backend, proxy, args)
     if backend == BACKEND_PATCHRIGHT:
         if humanize:
             logger.debug("browser_backend: humanize not supported by patchright, ignored")
@@ -691,3 +717,73 @@ def browser_info(config: dict[str, Any] | None = None) -> dict[str, Any]:
         info["binary"] = "bundled stealth Chromium"
         info["version"] = bundled
     return info
+
+
+# ---------------------------------------------------------------------------
+# Launch registry: lets a finished download close the windows its still-running
+# (waived) sources opened. Racing returns on the first success, but the other
+# source threads keep their visible browsers open until they time out.
+# ---------------------------------------------------------------------------
+
+import threading as _threading
+import time as _time
+
+_LAUNCHED: list[tuple[float, Any]] = []
+_LAUNCHED_LOCK = _threading.Lock()
+
+
+def _remember(obj: Any) -> Any:
+    with _LAUNCHED_LOCK:
+        _LAUNCHED.append((_time.monotonic(), obj))
+    return obj
+
+
+# Set by the download orchestrator: returns False when the calling thread works
+# for a download that has already finished (a waived racing source). Such
+# threads must not (re)launch browsers -- the shared browser would otherwise be
+# relaunched after the finished download closed it.
+LAUNCH_GUARD: Any = None
+
+
+def _check_launch_guard() -> None:
+    if LAUNCH_GUARD is not None and not LAUNCH_GUARD():
+        raise RuntimeError("download already finished; not launching a browser for a waived source")
+
+
+def launch(**kwargs: Any) -> Any:
+    """Launch the resolved backend's stealth browser and register it (see ``close_browsers_since``)."""
+    _check_launch_guard()
+    return _remember(_launch_unregistered(**kwargs))
+
+
+def launch_persistent_context(user_data_dir: str, **kwargs: Any) -> Any:
+    """Launch a persistent-profile context and register it (see ``close_browsers_since``)."""
+    _check_launch_guard()
+    return _remember(_launch_persistent_unregistered(user_data_dir, **kwargs))
+
+
+def close_browsers_since(t0: float) -> int:
+    """Force-close every browser launched at or after monotonic time ``t0``.
+
+    Sync-API objects are bound to the thread that created them, so they cannot
+    be closed from here; kill the driver process tree instead. The owning
+    threads then fail fast, and the shared per-thread browser is relaunched on
+    next use (browser_engine checks ``is_connected``).
+    """
+    from .browser_engine import _tree_kill
+
+    with _LAUNCHED_LOCK:
+        targets = [obj for ts, obj in _LAUNCHED if ts >= t0]
+        _LAUNCHED[:] = [(ts, obj) for ts, obj in _LAUNCHED if ts < t0]
+    closed = 0
+    for obj in targets:
+        try:
+            proc = obj._impl_obj._connection._transport._proc  # type: ignore[attr-defined]
+        except Exception:
+            proc = None
+        try:
+            _tree_kill(proc)
+            closed += 1
+        except Exception:
+            pass
+    return closed

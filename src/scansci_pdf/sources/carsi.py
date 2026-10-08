@@ -18,6 +18,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from ..browser_pdf import capture_pdf_via_cdp, find_page_pdf_link
 from ..config import DATA_DIR
 from ..log import get_logger
 from ..publisher_strategies import (
@@ -174,6 +175,16 @@ class CARSIClient:
                                 return _success(doi, output_path, "CARSI-Browser")
                         return None
 
+                    def _try_fetch_pdf(url: str) -> dict[str, Any] | None:
+                        """Open a PDF URL in the page and save the PDF the browser receives."""
+                        body = capture_pdf_via_cdp(context, page, url)
+                        if body:
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+                            output_path.write_bytes(body)
+                            if is_pdf_file(output_path):
+                                return _success(doi, output_path, "CARSI-Browser")
+                        return None
+
                     # Restore saved cookies if any (supplements persistent profile)
                     cookie_file = self._cookie_path(publisher)
                     if cookie_file.exists():
@@ -234,7 +245,6 @@ class CARSIClient:
                         log.info("   [CARSI-Browser] Cloudflare challenge did not resolve")
 
                     # Step 1b: Check if restored cookies already grant access
-                    has_cookies = cookie_file.exists()
                     needs_login = False
                     try:
                         needs_login = page.evaluate("""
@@ -253,35 +263,35 @@ class CARSIClient:
                         log.info(f"   [CARSI-Browser] paywall check error (likely Cloudflare): {_e}")
                         needs_login = True
 
-                    # Even if page looks accessible, verify cookies work by
-                    # trying a quick pdfft probe. ScienceDirect may accept
-                    # expired cookies without showing a paywall, but return
-                    # HTML instead of PDF for /pdfft requests.
+                    # Decide whether access is already granted from the page itself.
+                    # (A fetch() of /pdfft cannot prove it: ScienceDirect's PDF link needs
+                    # page-issued md5/pid params and redirects cross-origin, so such a
+                    # probe fails even with valid entitlement.)
                     cookies_valid = False
-                    if has_cookies and not needs_login:
-                        pii_from_url = ""
-                        _pm = re.search(r"pii/([A-Z0-9]+)", page.url)
-                        if _pm:
-                            pii_from_url = _pm.group(1)
-                        if pii_from_url:
-                            try:
-                                probe_ok = page.evaluate(f"""
-                                    (async () => {{
-                                        try {{
-                                            const r = await fetch('/science/article/pii/{pii_from_url}/pdfft',
-                                                {{credentials: 'include', headers: {{'Accept': 'application/pdf'}}}});
-                                            const ct = r.headers.get('content-type') || '';
-                                            return r.ok && ct.includes('pdf');
-                                        }} catch(e) {{ return false; }}
-                                    }})()
-                                """)
-                                cookies_valid = bool(probe_ok)
-                                if cookies_valid:
-                                    log.info("   [CARSI-Browser] Cookie probe OK, skipping login")
-                                else:
-                                    log.info("   [CARSI-Browser] Cookie probe failed, re-login needed")
-                            except Exception:
-                                log.info("   [CARSI-Browser] Cookie probe error, will re-login")
+                    if not needs_login:
+                        try:
+                            cookies_valid = bool(page.evaluate("""
+                                () => {
+                                    if (!document.body) return false;
+                                    const body = (document.body.innerText || '').toLowerCase();
+                                    if (body.includes('get access') || body.includes('purchase pdf')
+                                        || body.includes('access through your institution')) return false;
+                                    for (const a of document.querySelectorAll('a')) {
+                                        const href = (a.getAttribute('href') || '').toLowerCase();
+                                        const text = (a.innerText || '').toLowerCase();
+                                        if (href.includes('pdfft') || href.includes('/doi/pdf')
+                                            || href.includes('/pdfdirect/') || text.includes('view pdf')
+                                            || text.includes('download pdf')) return true;
+                                    }
+                                    return false;
+                                }
+                            """))
+                        except Exception as _e:
+                            log.info(f"   [CARSI-Browser] access check error: {_e}")
+                        if cookies_valid:
+                            log.info("   [CARSI-Browser] Full-text access detected, skipping login")
+                        else:
+                            log.info("   [CARSI-Browser] No full-text access on page, login needed")
 
                     if not cookies_valid:
                         # Step 2: Navigate to "Institutional login" link on article page
@@ -370,6 +380,15 @@ class CARSIClient:
                     if saved:
                         return saved
 
+                    # Step 5b: Fetch the page's own PDF link (carries page-issued tokens,
+                    # e.g. ScienceDirect's /pdfft?md5=...&pid=...)
+                    page_pdf_href = find_page_pdf_link(page)
+                    if page_pdf_href:
+                        log.info(f"   [CARSI-Browser] Page PDF link: {page_pdf_href[:80]}")
+                        saved = _try_fetch_pdf(page_pdf_href)
+                        if saved:
+                            return saved
+
                     # Step 6: Try direct PDF URL
                     pii_match = re.search(r"pii/([A-Z0-9]+)", page.url)
                     pii_value = pii_match.group(1) if pii_match else ""
@@ -398,7 +417,7 @@ class CARSIClient:
                             time.sleep(5)
                         except Exception:
                             pass
-                        saved = _try_save_captured()
+                        saved = _try_save_captured() or _try_fetch_pdf(page.url)
                         if saved:
                             return saved
 
@@ -414,7 +433,7 @@ class CARSIClient:
                             time.sleep(5)
                         except Exception:
                             pass
-                        saved = _try_save_captured()
+                        saved = _try_save_captured() or _try_fetch_pdf(page.url)
                         if saved:
                             return saved
 
@@ -438,7 +457,7 @@ class CARSIClient:
                     if click_result:
                         log.info(f"   [CARSI-Browser] Clicked: {str(click_result)[:80]}")
                         time.sleep(8)
-                        saved = _try_save_captured()
+                        saved = _try_save_captured() or _try_fetch_pdf(page.url)
                         if saved:
                             return saved
 

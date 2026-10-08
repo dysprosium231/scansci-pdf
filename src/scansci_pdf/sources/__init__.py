@@ -187,6 +187,27 @@ def _try_source(
 ) -> dict[str, Any] | None:
     from .scoring import record_result, classify_error, get_user_advice
     t0 = time.time()
+    _SOURCE_TLS.doi = normalize_doi(doi) if not is_arxiv_identifier(doi) else doi
+    try:
+        result = _try_source_inner(source_fn, doi, output_path, config, label, use_tor, t0,
+                                   record_result, classify_error, get_user_advice)
+    finally:
+        settled = _SOURCE_TLS.doi in _SETTLED
+        _SOURCE_TLS.doi = None
+    if settled:
+        # Late finisher of an already-returned download: its copy is a duplicate.
+        if output_path.exists():
+            try:
+                output_path.unlink()
+            except OSError:
+                pass
+        return None
+    return result
+
+
+def _try_source_inner(source_fn: Any, doi: str, output_path: Path, config: dict[str, Any], label: str,
+                      use_tor: bool, t0: float, record_result: Any, classify_error: Any,
+                      get_user_advice: Any) -> dict[str, Any] | None:
 
     # Limit concurrency for browser-based sources
     is_browser = label in _BROWSER_SOURCE_LABELS
@@ -782,6 +803,19 @@ def _auto_rename(result: dict[str, Any], identifier: str, config: dict[str, Any]
             result["file"] = str(new_path)
             result["renamed"] = True
             log.info(f"   Renamed: {file_path.name} -> {new_path.name}")
+            # Racing leaves one "<doi>_<Source>.pdf" copy per source that also
+            # succeeded; the winner is now saved under its final name.
+            if _doi:
+                removed = 0
+                for dup in new_path.parent.glob(f"{safe_filename(_doi)}_*.pdf"):
+                    if dup != new_path:
+                        try:
+                            dup.unlink()
+                            removed += 1
+                        except OSError:
+                            pass
+                if removed:
+                    log.info(f"   Removed {removed} duplicate source cop{'y' if removed == 1 else 'ies'}")
             # Update DOI→file index for dedup
             if target_dir and _doi:
                 _update_doi_index(
@@ -804,6 +838,18 @@ def _auto_rename(result: dict[str, Any], identifier: str, config: dict[str, Any]
 # parallel browser task for the same paper — the "infinite popup" experience.
 _INFLIGHT_LOCK = threading.Lock()
 _INFLIGHT: set[str] = set()
+
+# DOIs whose download() has returned. Racing returns on the first success while
+# other sources keep running ("waived"); those late finishers check this set to
+# drop their duplicate files and to stop launching browsers.
+_SETTLED: set[str] = set()
+_SOURCE_TLS = threading.local()
+
+
+def _source_may_continue() -> bool:
+    """LAUNCH_GUARD hook: False when this thread's download has already finished."""
+    doi = getattr(_SOURCE_TLS, "doi", None)
+    return not (doi and doi in _SETTLED)
 
 
 # Per-download record of WHY each racing source failed. A channel being
@@ -854,6 +900,8 @@ def download(
                        "racing sources); retry in a minute only if it failed",
             )
         _INFLIGHT.add(key)
+        _SETTLED.discard(key)
+    t0 = time.monotonic()
     try:
         return _download_impl(
             identifier,
@@ -869,6 +917,19 @@ def download(
     finally:
         with _INFLIGHT_LOCK:
             _INFLIGHT.discard(key)
+            _SETTLED.add(key)
+            idle = not _INFLIGHT
+        # Racing returns on the first success but waived sources keep their
+        # browser windows open. Close what this download launched — only when
+        # no other download is in flight, so we never kill a concurrent one.
+        if idle:
+            try:
+                from ..browser_backend import close_browsers_since
+                n = close_browsers_since(t0)
+                if n:
+                    log.info(f"   Closed {n} browser(s) left open by this download")
+            except Exception as exc:
+                log.info(f"   Browser cleanup skipped: {exc}")
 
 
 def _download_impl(
@@ -1699,3 +1760,9 @@ def batch_download(
     }
     _write_download_results(all_results, output_dir)
     return summary
+
+try:
+    from .. import browser_backend as _bb
+    _bb.LAUNCH_GUARD = _source_may_continue
+except Exception:
+    pass
