@@ -36,6 +36,7 @@ class TestResolveBackend:
 def test_camoufox_launch_drops_chromium_args(monkeypatch):
     """Chromium flags must never reach the Firefox binary (they become
     open-URL arguments there); launch proceeds without them."""
+    pytest.importorskip("camoufox")  # optional backend
     captured: dict = {}
 
     fake_pw = type("PW", (), {})()
