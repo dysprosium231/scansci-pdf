@@ -207,6 +207,18 @@ def _save_cookies_json(cookies: list[dict[str, Any]], cookie_file: Path) -> None
         json.dumps(cookie_data, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
+    # Also sync to legacy webvpn-cookies.json for PaperFetcher.auth compatibility
+    try:
+        from .auth import _get_cookie_path
+        auth_cookie_path = _get_cookie_path({})
+        auth_cookie_path.parent.mkdir(parents=True, exist_ok=True)
+        auth_cookie_path.write_text(
+            json.dumps(cookie_data, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
 
 
 def _save_cookies_netscape(cookies: list[dict[str, Any]], cookie_file: Path) -> None:
@@ -272,45 +284,131 @@ def open_login_browser(
         log.info("   [browser] cloakbrowser not installed")
         return (False, None, None, None) if keep_alive else False
 
+    # Close any lingering background shared browser on this thread
     try:
-        browser = launch(headless=False, humanize=True,
-                         args=["--disable-features=CrossOriginOpenerPolicy"],
-                         config=config)
+        from .browser_engine import close_shared_browser
+        close_shared_browser(config)
+    except Exception:
+        pass
+
+    browser = None
+    context = None
+
+    browser_args = [
+        "--disable-features=CrossOriginOpenerPolicy",
+        "--start-maximized",
+    ]
+
+    try:
+        browser = launch(
+            headless=False,
+            humanize=True,
+            args=browser_args,
+            config=config,
+        )
         context = browser.new_context()
-        page = context.new_page()
+    except Exception as exc:
+        log.error(f"   [browser] Failed to launch browser: {exc}")
+        return (False, None, None, None) if keep_alive else False
+
+    def _close_all():
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+
+    try:
+        # Seed previously saved cookies into context if available
+        if cookie_file.exists():
+            try:
+                saved_raw = json.loads(cookie_file.read_text(encoding="utf-8"))
+                if saved_raw:
+                    pw_cookies = []
+                    for c in saved_raw:
+                        c_dict = {
+                            "name": c["name"],
+                            "value": c["value"],
+                            "domain": c.get("domain", ""),
+                            "path": c.get("path", "/"),
+                        }
+                        if c.get("expires", 0) > 0:
+                            c_dict["expires"] = c["expires"]
+                        pw_cookies.append(c_dict)
+                    context.add_cookies(pw_cookies)
+            except Exception:
+                pass
+
+        page = context.pages[0] if context.pages else context.new_page()
 
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.bring_to_front()
+            except Exception:
+                pass
         except Exception as exc:
             log.info(f"   [browser] Page load warning: {exc}")
             print("  页面加载超时，但仍可手动登录。")
 
         elapsed = 0
         while elapsed < max_wait:
-            time.sleep(3)
-            elapsed += 3
+            time.sleep(2)
+            elapsed += 2
+
+            if elapsed % 10 == 0:
+                log.info(f"   [browser] Waiting for user login... elapsed={elapsed}s, open_tabs={len(context.pages)}")
 
             try:
-                current_url = page.url
-                if remote:
-                    remote.update_url(current_url)
+                pages = [p for p in context.pages if not p.is_closed()]
             except Exception:
+                pages = []
+
+            if not pages:
                 log.info("   [browser] Browser closed by user.")
                 if remote:
                     remote.stop()
+                # Salvage cookies if user completed login and manually closed the window
+                try:
+                    salvaged = context.cookies()
+                    if salvaged and len(salvaged) >= 3:
+                        if detect_login is None or detect_login(context, None):
+                            _save_cookies_json(salvaged, cookie_file)
+                            netscape_path = cookie_file.with_suffix(".txt")
+                            _save_cookies_netscape(salvaged, netscape_path)
+                            log.info(f"   [browser] Salvaged {len(salvaged)} cookies upon window close.")
+                            print(f"  登录成功！Cookie 已保存至 {cookie_file}")
+                            if auto_import:
+                                _import_to_browser(netscape_path, config)
+                            if not keep_alive:
+                                _close_all()
+                            return True
+                except Exception:
+                    pass
                 if not keep_alive:
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
+                    _close_all()
                 return (False, None, None, None) if keep_alive else False
 
-            # A custom detector is authoritative: when it says "not yet", the
-            # generic URL-shape fallback below must NOT confirm the login —
-            # it used to bless an unauthenticated redirect to the publisher
-            # (cookie count > 3) as success for CARSI/EZProxy (#29, #62).
+            active_page = pages[-1]
+            try:
+                current_url = active_page.url
+                if remote:
+                    remote.update_url(current_url)
+            except Exception:
+                pass
+
             if detect_login is not None:
-                if detect_login(context, page):
+                matched = False
+                for p in reversed(pages):
+                    try:
+                        if detect_login(context, p):
+                            matched = True
+                            active_page = p
+                            break
+                    except Exception:
+                        continue
+
+                if matched:
                     cookies = context.cookies()
                     _save_cookies_json(cookies, cookie_file)
                     netscape_path = cookie_file.with_suffix(".txt")
@@ -322,11 +420,13 @@ def open_login_browser(
                     if remote:
                         remote.stop()
                     if keep_alive:
-                        return True, context, page
-                    browser.close()
+                        return True, context, active_page
+                    time.sleep(0.5)
+                    _close_all()
                     return True
                 continue
 
+            # Generic detection fallback (when detect_login is None)
             url_lower = current_url.lower()
             if "login" not in url_lower and "cas" not in url_lower and "sso" not in url_lower:
                 cookies = context.cookies()
@@ -341,23 +441,22 @@ def open_login_browser(
                     if remote:
                         remote.stop()
                     if keep_alive:
-                        return True, context, page
-                    browser.close()
+                        return True, context, active_page
+                    time.sleep(0.5)
+                    _close_all()
                     return True
 
         print("  登录超时。")
         if remote:
             remote.stop()
         if not keep_alive:
-            try:
-                browser.close()
-            except Exception:
-                pass
+            _close_all()
         return (False, None, None, None) if keep_alive else False
 
     except Exception as exc:
         log.info(f"   [browser] Login error: {exc}")
         print(f"  登录出错: {exc}")
+        _close_all()
         return (False, None, None, None) if keep_alive else False
 
 
@@ -371,11 +470,83 @@ def webvpn_login(config: dict[str, Any]) -> bool:
 
     from .config import DATA_DIR
     cache_dir = Path(config.get("cache_dir", str(DATA_DIR / "cache")))
-    # Canonical name matches the loader in instsci.instsci_cookie_path; the
-    # loader also accepts the legacy underscore variant for migration.
     cookie_file = cache_dir / "instsci-cookies.json"
 
-    return open_login_browser(base, config, cookie_file=cookie_file, max_wait=600)
+    def _detect(context: Any, page: Any) -> bool:
+        try:
+            cookies = context.cookies()
+            cookie_names = {(c.get("name") or "").lower() for c in cookies}
+
+            # 1. Page DOM and URL checks (when page is available)
+            if page is not None:
+                try:
+                    # Explicit login form signals -> definitely NOT logged in
+                    has_pwd = page.locator("input[type='password']").count() > 0
+                    has_login_form = (
+                        page.locator("#loginForm").count() > 0 or
+                        page.locator("form[action*='login']").count() > 0 or
+                        page.locator(".btn-login").count() > 0
+                    )
+                    title = ""
+                    try:
+                        title = (page.title() or "").lower()
+                    except Exception:
+                        pass
+                    is_cas = "cas login" in title or "统一身份认证" in title or "用户登录" in title
+
+                    if has_pwd or has_login_form or is_cas:
+                        return False
+
+                    # Portal signals -> authenticated!
+                    has_portal = (
+                        page.locator("text=外文数据库").count() > 0 or
+                        page.locator("text=中文数据库").count() > 0 or
+                        page.locator("text=WEB资源").count() > 0 or
+                        page.locator("text=常用业务系统").count() > 0 or
+                        page.locator("text=退出").count() > 0 or
+                        page.locator("text=注销").count() > 0 or
+                        page.locator("a[href*='logout']").count() > 0
+                    )
+                    if has_portal:
+                        log.info("   [WebVPN] Detected portal marker in DOM")
+                        return True
+                except Exception:
+                    pass
+
+            # 2. Authoritative cookie checks (gateway sets wrdvpn_upstream_ip after auth)
+            if "wrdvpn_upstream_ip" in cookie_names:
+                log.info("   [WebVPN] Detected wrdvpn_upstream_ip cookie")
+                return True
+
+            # 3. For other WebVPN flavors (ZTE, etc.)
+            if "_zte_sid_" in cookie_names:
+                return True
+
+            # 4. If window was closed or page navigating, check if cookies pass live session probe
+            if any("wengine_vpn_ticket" in n for n in cookie_names) and len(cookies) >= 5:
+                try:
+                    import requests
+                    from .sources.instsci import convert_url
+                    from .network import USER_AGENT
+                    test_url = convert_url("https://www.nature.com", base, config)
+                    jar = requests.cookies.RequestsCookieJar()
+                    for c in cookies:
+                        jar.set(c["name"], c["value"], domain=c.get("domain", ""), path=c.get("path", "/"))
+                    s = requests.Session()
+                    s.trust_env = False
+                    s.cookies.update(jar)
+                    resp = s.get(test_url, timeout=5, allow_redirects=True, headers={"User-Agent": USER_AGENT})
+                    if resp.status_code == 200 and "login" not in resp.url.lower() and "cas" not in resp.url.lower():
+                        log.info("   [WebVPN] Cookie probe verified working session")
+                        return True
+                except Exception:
+                    pass
+
+            return False
+        except Exception:
+            return False
+
+    return open_login_browser(base, config, cookie_file=cookie_file, detect_login=_detect, max_wait=600)
 
 
 def carsi_login(publisher: str, config: dict[str, Any], *, login_url: str, domains: list[str]) -> bool:
