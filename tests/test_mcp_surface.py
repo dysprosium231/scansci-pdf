@@ -1,4 +1,4 @@
-"""MCP surface contract: the tool diet (45 -> 18) must stay lean and dispatchable."""
+"""MCP surface contract: the tool diet (45 -> 19) must stay lean and dispatchable."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from scansci_pdf.server import (
 EXPECTED = {
     "scansci_pdf_batch_download",
     "scansci_pdf_cache_clear",
+    "scansci_pdf_cancel",
     "scansci_pdf_channel_status",
     "scansci_pdf_citation",
     "scansci_pdf_config",
@@ -37,7 +38,7 @@ EXPECTED = {
 def test_tool_surface_matches_expected():
     tools = asyncio.run(mcp_app.list_tools())
     assert {t.name for t in tools} == EXPECTED
-    assert len(tools) == 18
+    assert len(tools) == 19
 
 
 def test_tool_descriptions_are_diet_sized():

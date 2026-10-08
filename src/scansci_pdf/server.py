@@ -769,6 +769,13 @@ def scansci_pdf_cache_clear(identifier: str | None = None) -> str:
     return json.dumps({"cleared": cleared})
 
 
+@mcp_app.tool()
+def scansci_pdf_cancel() -> str:
+    """Cancel all in-flight downloads/batches: stop racing, skip pending papers, close their browser windows."""
+    from .sources import cancel_downloads
+    return json.dumps(cancel_downloads(), ensure_ascii=False)
+
+
 def scansci_pdf_import_bib(
     bib_file: str,
     output_dir: str | None = None,

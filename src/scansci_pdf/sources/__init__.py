@@ -435,6 +435,8 @@ def _wait_any(events: tuple[threading.Event, threading.Event], timeout: float) -
     while time.monotonic() < deadline:
         if any(e.is_set() for e in events):
             return True
+        if _cancelled():
+            return False
         time.sleep(0.05)
     return any(e.is_set() for e in events)
 
@@ -458,6 +460,8 @@ def _run_tiers_parallel(
     """
     if failures is None:
         failures = []
+    if _cancelled():
+        return None
     # A new race for this DOI is live again: callers such as batch_download race
     # without going through download(), so clear any earlier "settled" mark here
     # or every result of this race would be discarded as a late finisher.
@@ -851,6 +855,35 @@ _SETTLED: set[str] = set()
 _SOURCE_TLS = threading.local()
 
 
+# Cooperative cancellation. cancel_downloads() bumps the generation; every
+# download() remembers the generation it started under (thread-local), so it
+# knows it was cancelled without killing threads. Downloads started afterwards
+# are unaffected.
+_CANCEL_GEN = [0]
+_DL_TLS = threading.local()
+
+
+def _cancelled() -> bool:
+    gen = getattr(_DL_TLS, "gen", None)
+    return gen is not None and gen != _CANCEL_GEN[0]
+
+
+def cancel_downloads() -> dict[str, Any]:
+    """Cancel every download in flight: stop waiting, drop late results, close windows."""
+    with _INFLIGHT_LOCK:
+        _CANCEL_GEN[0] += 1
+        keys = sorted(_INFLIGHT)
+        _SETTLED.update(keys)  # sources still running drop results, launch nothing
+    closed = 0
+    try:
+        from ..browser_backend import close_browsers_since
+        closed = close_browsers_since(0.0)
+    except Exception as exc:
+        log.info(f"   Cancel: browser cleanup skipped: {exc}")
+    log.info(f"   Cancelled {len(keys)} download(s); closed {closed} browser(s)")
+    return {"cancelled": keys, "browsers_closed": closed}
+
+
 def _source_may_continue() -> bool:
     """LAUNCH_GUARD hook: False when this thread's download has already finished."""
     doi = getattr(_SOURCE_TLS, "doi", None)
@@ -907,8 +940,11 @@ def download(
         _INFLIGHT.add(key)
         _SETTLED.discard(key)
     t0 = time.monotonic()
+    prev_gen = getattr(_DL_TLS, "gen", None)
+    if prev_gen is None:  # nested calls (batch phase 2) keep the batch's generation
+        _DL_TLS.gen = _CANCEL_GEN[0]
     try:
-        return _download_impl(
+        result = _download_impl(
             identifier,
             output_dir,
             scihub_enabled=scihub_enabled,
@@ -919,7 +955,12 @@ def download(
             _institutional=_institutional,
             strategy=strategy,
         )
+        if _cancelled() and not result.get("success"):
+            return fail(key, "cancelled by user", error_type="cancelled", action="none")
+        return result
     finally:
+        if prev_gen is None:
+            _DL_TLS.gen = None
         with _INFLIGHT_LOCK:
             _INFLIGHT.discard(key)
             _SETTLED.add(key)
@@ -1661,7 +1702,11 @@ def batch_download(
     completed_count = [0]
     num_invalid = len(invalid_results)
 
+    batch_gen = _CANCEL_GEN[0]
+
     def _staggered_download(ident: str) -> dict[str, Any]:
+        if _CANCEL_GEN[0] != batch_gen:
+            return fail(ident, "cancelled by user", error_type="cancelled", action="none")
         with delay_lock:
             elapsed = time.time() - last_download_time[0]
             if elapsed < delay_between:
@@ -1713,6 +1758,9 @@ def batch_download(
     # Phase 2: Publisher-grouped institutional download for failed DOIs
     phase1_results = dict(zip(pending_identifiers, results))
     failed_phase1 = [doi for doi, r in phase1_results.items() if r and not r.get("success")]
+    if failed_phase1 and _CANCEL_GEN[0] != batch_gen:
+        log.info(f"Batch {batch_id}: cancelled — skipping Phase 2")
+        failed_phase1 = []
     if failed_phase1:
         log.info(f"Batch {batch_id}: Phase 1 failed for {len(failed_phase1)} DOIs, starting Phase 2...")
         _batch_institutional_phase(failed_phase1, Path(config["output_dir"]) if not output_dir else Path(output_dir), config, batch_id, phase1_results)
