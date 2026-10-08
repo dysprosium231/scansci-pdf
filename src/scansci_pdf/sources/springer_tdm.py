@@ -19,6 +19,11 @@ from pathlib import Path
 from typing import Any
 
 SPRINGER_TDM_URL = "https://api.springernature.com/xmldata/jats"
+# Free portal keys are scoped per API: an Open Access API key gets 401 from
+# the TDM endpoint but is a valid key. Probe the OA endpoint to tell the two
+# apart, so an OA-only key is a silent miss instead of "recreate your key".
+SPRINGER_OA_URL = "https://api.springernature.com/openaccess/jats"
+_OA_ONLY_KEYS: dict[str, bool] = {}
 
 # Known paywalled article (Math. Ann., verified closed via OpenAlex) used to
 # probe whether a key carries subscription full-text entitlement.
@@ -55,6 +60,8 @@ def fetch_fulltext_xml(doi: str, api_key: str,
     except Exception as e:
         return None, f"error:{type(e).__name__}"
 
+    if resp.status_code == 401 and _is_oa_only_key(api_key, config):
+        return None, "oa_only"
     if resp.status_code in (401, 403):
         # 401 = bad key; 403 = key valid but no entitlement for this content
         return None, "invalid_key" if resp.status_code == 401 else "not_entitled"
@@ -69,6 +76,22 @@ def fetch_fulltext_xml(doi: str, api_key: str,
     # 200 without a body: either the DOI is unknown to the API or the key
     # lacks full-text rights (both surface identically) — not a hard failure.
     return None, "not_entitled" if "<response" in xml else "not_found"
+
+
+def _is_oa_only_key(api_key: str, config: dict[str, Any]) -> bool:
+    """True when the OA API accepts a key that the TDM endpoint rejected."""
+    if api_key not in _OA_ONLY_KEYS:
+        try:
+            resp = _session(config).get(
+                SPRINGER_OA_URL,
+                params={"q": f'doi:"{_ENTITLEMENT_PROBE_DOI}"', "p": 1, "s": 1,
+                        "api_key": api_key},
+                timeout=(10, 30),
+            )
+        except Exception:
+            return False  # undecided: don't cache, fall back to invalid_key
+        _OA_ONLY_KEYS[api_key] = resp.status_code not in (401, 403)
+    return _OA_ONLY_KEYS[api_key]
 
 
 def try_springer_tdm(doi: str, output_path: Path,
@@ -127,6 +150,14 @@ def validate_springer_key(api_key: str,
         }
     if status == "invalid_key":
         return {"status": "invalid_key", "detail": "API rejected the key (HTTP 401)"}
+    if status == "oa_only":
+        return {
+            "status": "oa_only",
+            "detail": (
+                "key is valid for the Open Access API only — no TDM full-text "
+                "rights; Springer papers keep using the PDF lanes"
+            ),
+        }
     if status == "not_entitled":
         return {
             "status": "not_entitled",

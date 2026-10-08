@@ -700,6 +700,11 @@ def scansci_pdf_springer_setup(test: bool = False) -> str:
                 result["message"] += (
                     f" ⚠️ {v['detail']}。无权限时 10.1007 走 WebVPN/CARSI 机构级联。"
                 )
+            elif v["status"] == "oa_only":
+                result["message"] += (
+                    " ⚠️ 这是 Open Access API key，没有 TDM 全文权限；TDM 车道自动跳过，"
+                    "Springer 论文照常走 PDF 车道（OA 直链/机构 IP/WebVPN/CARSI）。"
+                )
             elif v["status"] == "invalid_key":
                 result["message"] += f" ❌ {v['detail']}，请到 dev.springernature.com 重新生成。"
             else:

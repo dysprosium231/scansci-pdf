@@ -248,8 +248,8 @@ def mask_config_value(key: str, value: Any) -> Any:
     """
     if value is None:
         return value
-    if key in SENSITIVE_KEYS:
-        return "***"
+    if key in SENSITIVE_KEYS or key.endswith(("_api_key", "_token", "_insttoken")):
+        return "***" if value else value
     if "proxy" in key.lower() and isinstance(value, str) and "@" in value:
         return _PROXY_URL_CREDS_RE.sub(r"\1***@", value)
     return value

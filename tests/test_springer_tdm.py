@@ -65,6 +65,30 @@ class TestTrySpringerTdm:
                                 {"springer_api_key": "k"}) is None
 
 
+def _mock_routes(monkeypatch, tdm, oa):
+    class _S:
+        def get(self, url, *a, **k):
+            return oa if "openaccess" in url else tdm
+
+    monkeypatch.setattr(springer_tdm, "_session", lambda config: _S())
+    monkeypatch.setattr(springer_tdm, "_OA_ONLY_KEYS", {})
+
+
+class TestOaOnlyKey:
+    def test_oa_only_key_is_silent_skip(self, tmp_path: Path, monkeypatch):
+        _mock_routes(monkeypatch, _Resp(401, ""), _Resp(404, "{}"))
+        assert try_springer_tdm(DOI, tmp_path / "out.pdf",
+                                {"springer_api_key": "oa"}) is None
+
+    def test_validate_reports_oa_only(self, monkeypatch):
+        _mock_routes(monkeypatch, _Resp(401, ""), _Resp(200, "<response/>"))
+        assert springer_tdm.validate_springer_key("oa", {})["status"] == "oa_only"
+
+    def test_key_rejected_everywhere_is_invalid(self, monkeypatch):
+        _mock_routes(monkeypatch, _Resp(401, ""), _Resp(401, ""))
+        assert springer_tdm.validate_springer_key("bad", {})["status"] == "invalid_key"
+
+
 class TestValidation:
     def test_validate_entitled(self, monkeypatch):
         _mock_session(monkeypatch, _Resp(200, FULL))
