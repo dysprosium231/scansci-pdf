@@ -1,3 +1,7 @@
+> [!IMPORTANT]
+> **本仓库已迁移到 [dysprosium231/litloop-paper-agent](https://github.com/dysprosium231/litloop-paper-agent)（LitLoop）**，后续更新只在新仓库进行。已经从这里安装的，运行一次 `python scripts/deploy.py` 会自动切换到新仓库（如提示已是最新，再运行一次即可）。
+> This repository has moved to [dysprosium231/litloop-paper-agent](https://github.com/dysprosium231/litloop-paper-agent).
+
 <div align="center">
   <h1>LitLoop</h1>
   <p><strong>Academic Paper Agent</strong> · 学术论文 Agent：检索 → 下载 → Zotero 归档 → 分析归纳</p>
